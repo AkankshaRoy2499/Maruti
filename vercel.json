@@ -1,0 +1,10 @@
+{
+  "builds": [
+    { "src": "repo-check/index.html", "use": "@vercel/static" },
+    { "src": "repo-check/api/gs.js", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "^/api/gs(.*)$", "dest": "repo-check/api/gs.js" },
+    { "src": "^/(.*)$", "dest": "repo-check/index.html" }
+  ]
+}
