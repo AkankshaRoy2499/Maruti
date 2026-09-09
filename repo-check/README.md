@@ -1,10 +1,27 @@
 # Maruti — Inspection Report Builder
 
-A self-contained fire/life-safety inspection report tool: fill in device-level
-inspection data (Fire Alarm, plus configurable types like Extinguisher, Pump,
-Sprinkler, etc.), get auto-calculated summary tables, and export a branded PDF.
-Includes a full Customers CRM (Billing Location → Service Location → Job
-Ticket → Reports) backed by a Google Sheet.
+A self-contained fire/life-safety inspection CRM: log in, create a ticket for a
+customer's site, pick a report type (Fire Alarm, plus configurable types like
+Extinguisher, Pump, Sprinkler, etc.), fill it in, and export a branded PDF.
+Includes a full Customers CRM (Billing Location → Service Location → Ticket →
+Reports), a global Tickets list, and a Scheduler calendar — all backed by a
+Google Sheet.
+
+## Login
+
+The app is gated behind a login screen. A master admin account is auto-seeded
+the first time the backend runs:
+
+- Email: `support@maruti@zentrades.pro` (as specified when this was set up —
+  edit `MASTER_EMAIL` in `google-apps-script/Code.gs` and redeploy a "New
+  version" if this should be a different address; it only re-seeds while the
+  Users sheet is still empty)
+- Password: `Admin@123`
+
+The master admin can create additional users (admin or regular) from the
+**Admin** button in the top bar. Passwords are hashed (SHA-256 + a fixed
+pepper) before they're written to the Sheet — change `PASSWORD_PEPPER` in
+`Code.gs` if every existing password needs to be invalidated at once.
 
 ## Project structure
 
@@ -58,3 +75,13 @@ the `/exec` URL stays the same and nothing else needs updating.
   Kitchen Hood, Emergency Lighting, Backflow, Dampers, Standpipe, Clean
   Agent) are configured there — fields and repeatable tables, no code needed
   per type.
+- **Tickets** are the unit of work — created either from the **Tickets** tab
+  (a flat list across every customer) or the **Scheduler** tab (click a day
+  on the month calendar; chips are color-coded by status). Both open into the
+  same ticket detail view used by Customers → Service Location → Job
+  Tickets, where **+ Attach report** lets you fill and PDF-export any number
+  of report types (Fire Alarm included) against that one ticket. Each ticket
+  gets a human-friendly, auto-incrementing Ticket No (e.g. `TCK-1001`).
+- Sessions last 12 hours; a session token is required for every backend call,
+  so redeploying `Code.gs` (or the Sheet being unreachable) surfaces as a
+  clean "please log in again" rather than silent failures.

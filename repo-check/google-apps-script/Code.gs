@@ -13,17 +13,23 @@
  *    near the top of that tool's <script> so it connects automatically).
  *
  * UPDATING AN EXISTING DEPLOYMENT
- * If you've already deployed this once and are pasting in a newer version (like this
- * one, which adds JobTickets), pasting the code alone is not enough — Web App
- * deployments are pinned to a specific saved version. After pasting and saving:
+ * If you've already deployed this once and are pasting in a newer version, pasting the
+ * code alone is not enough — Web App deployments are pinned to a specific saved version.
+ * After pasting and saving:
  *   Deploy > Manage deployments > (pencil/edit icon on your existing deployment)
  *   > Version: "New version" > Deploy.
  * That keeps the same /exec URL (so nothing needs re-pasting into the tool) while
  * pushing this updated code live. New sheets/columns are created automatically
  * the next time the script runs — no manual sheet editing needed either way.
  *
- * Six tabs and their headers are created automatically (ensureSheets()), and any
- * columns added to SCHEMAS below get appended to existing sheets' header rows too.
+ * LOGIN
+ * The app is now gated behind a login screen. A master admin account is auto-created
+ * the first time this script runs (see MASTER_EMAIL / MASTER_PASSWORD below — the email
+ * is exactly what was requested when this was set up; edit the constant here and
+ * redeploy a "New version" if it was meant to be something else, then re-run once so
+ * the Users sheet re-seeds — it only seeds when the Users sheet is empty). The master
+ * admin can create additional users from the app's Admin panel; passwords are hashed
+ * (SHA-256 + a fixed pepper) before they're ever written to the sheet.
  */
 
 const SCHEMAS = {
@@ -31,20 +37,31 @@ const SCHEMAS = {
   ServiceLocations: ['id','billingId','name','address','cityState','contactName','contactPhone','notes','createdAt'],
   Notes:            ['id','serviceId','text','addedAt'],
   Attachments:      ['id','serviceId','name','mimeType','driveFileUrl','addedAt'],
-  JobTickets:       ['id','serviceId','jobDate','jobType','status','assignedTo','description','createdAt'],
+  JobTickets:       ['id','ticketNo','serviceId','jobDate','jobType','status','assignedTo','description','createdAt'],
   ReportTypes:      ['id','name','slug','schemaJson','createdAt'],
-  Reports:          ['id','serviceId','jobTicketId','reportType','buildingName','inspType','inspDate','savedAt','dataJson']
+  Reports:          ['id','serviceId','jobTicketId','reportType','buildingName','inspType','inspDate','savedAt','dataJson'],
+  Users:            ['id','email','passwordHash','role','createdAt'],
+  Sessions:         ['id','userId','email','role','createdAt','expiresAt']
 };
 
+// Master admin — seeded once into the Users sheet the first time it's empty.
+const MASTER_EMAIL = 'support@maruti@zentrades.pro';
+const MASTER_PASSWORD = 'Admin@123';
+const PASSWORD_PEPPER = 'maruti-frb-2026'; // change this to force every existing password to stop working
+const SESSION_HOURS = 12;
+
 function ensureSheets(){
-  // Fast path: skip the full 6-sheet migration check on every request — only
+  // Fast path: skip the full sheet migration check on every request — only
   // re-verify when the schema itself changes, or at most once every 6 hours.
   // This is the single biggest latency cost per call, so caching it matters.
   const cache = CacheService.getScriptCache();
   const schemaSig = Utilities.base64Encode(
     Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, JSON.stringify(SCHEMAS))
   );
-  if(cache.get('sheets_ensured_sig') === schemaSig) return;
+  if(cache.get('sheets_ensured_sig') === schemaSig){
+    seedMasterAdminIfNeeded_();
+    return;
+  }
 
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   Object.keys(SCHEMAS).forEach(name=>{
@@ -68,6 +85,14 @@ function ensureSheets(){
   if(def && ss.getSheets().length > 1 && def.getLastRow() === 0){
     ss.deleteSheet(def);
   }
+  seedMasterAdminIfNeeded_();
+}
+
+function seedMasterAdminIfNeeded_(){
+  const rows = getSheetData_('Users');
+  if(rows.length) return;
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Users');
+  sh.appendRow([Utilities.getUuid(), MASTER_EMAIL, hashPassword_(MASTER_PASSWORD), 'admin', new Date().toISOString()]);
 }
 
 function getSheetData_(sheetName){
@@ -107,21 +132,89 @@ function jsonOut_(obj){
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
 
+/* ============================= AUTH ============================= */
+
+function hashPassword_(password){
+  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(password) + PASSWORD_PEPPER);
+  return digest.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2,'0')).join('');
+}
+
+function stripPasswordHash_(row){
+  if(!row) return row;
+  const copy = {};
+  Object.keys(row).forEach(k=>{ if(k !== 'passwordHash') copy[k] = row[k]; });
+  return copy;
+}
+
+function makeSession_(user){
+  const token = Utilities.getUuid();
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Sessions');
+  const now = new Date();
+  const expires = new Date(now.getTime() + SESSION_HOURS*3600*1000);
+  sh.appendRow([token, user.id, user.email, user.role, now.toISOString(), expires.toISOString()]);
+  return {token, expiresAt: expires.toISOString()};
+}
+
+function getSession_(token){
+  if(!token) return null;
+  const rows = getSheetData_('Sessions');
+  const row = rows.find(r => String(r.id) === String(token));
+  if(!row) return null;
+  if(new Date(row.expiresAt) < new Date()) return null;
+  return row;
+}
+
+function cleanupExpiredSessions_(){
+  const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Sessions');
+  const values = sh.getDataRange().getValues();
+  const headers = values[0];
+  const expIdx = headers.indexOf('expiresAt');
+  const now = new Date();
+  for(let i=values.length-1;i>=1;i--){
+    if(new Date(values[i][expIdx]) < now) sh.deleteRow(i+1);
+  }
+}
+
+function nextTicketNo_(){
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try{
+    const props = PropertiesService.getScriptProperties();
+    const current = parseInt(props.getProperty('lastTicketNo') || '1000', 10);
+    const next = current + 1;
+    props.setProperty('lastTicketNo', String(next));
+    return 'TCK-' + next;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/* ============================= HTTP ENTRY POINTS ============================= */
+
 function doGet(e){
   try{
     ensureSheets();
     const action = e.parameter.action;
     const sheetName = e.parameter.sheet;
 
+    const session = getSession_(e.parameter.token);
+    if(!session) return jsonOut_({ok:false, error:'Not authenticated — please log in.', authRequired:true});
+    if(sheetName === 'Users' && session.role !== 'admin'){
+      return jsonOut_({ok:false, error:'Admin access required.'});
+    }
+
     if(action === 'list'){
       let rows = getSheetData_(sheetName);
       if(e.parameter.billingId) rows = rows.filter(r => String(r.billingId) === String(e.parameter.billingId));
       if(e.parameter.serviceId) rows = rows.filter(r => String(r.serviceId) === String(e.parameter.serviceId));
+      if(e.parameter.jobTicketId) rows = rows.filter(r => String(r.jobTicketId) === String(e.parameter.jobTicketId));
+      if(sheetName === 'Users') rows = rows.map(stripPasswordHash_);
       return jsonOut_({ok:true, rows});
     }
     if(action === 'get'){
       const rows = getSheetData_(sheetName);
-      const row = rows.find(r => String(r.id) === String(e.parameter.id));
+      let row = rows.find(r => String(r.id) === String(e.parameter.id));
+      if(sheetName === 'Users') row = stripPasswordHash_(row);
       return jsonOut_({ok:true, row: row || null});
     }
     if(action === 'search'){
@@ -145,6 +238,30 @@ function doPost(e){
     const action = body.action;
     const ss = SpreadsheetApp.getActiveSpreadsheet();
 
+    if(action === 'login'){
+      const email = String(body.email || '').trim();
+      const password = String(body.password || '');
+      const user = getSheetData_('Users').find(u => String(u.email).toLowerCase() === email.toLowerCase());
+      if(!user || user.passwordHash !== hashPassword_(password)){
+        return jsonOut_({ok:false, error:'Incorrect email or password.'});
+      }
+      cleanupExpiredSessions_();
+      const session = makeSession_(user);
+      return jsonOut_({ok:true, token: session.token, expiresAt: session.expiresAt, user:{id:user.id, email:user.email, role:user.role}});
+    }
+
+    const session = getSession_(body.token);
+
+    if(action === 'logout'){
+      if(session){
+        const shS = ss.getSheetByName('Sessions');
+        const rowIdx = findRowIndexById_(shS, body.token);
+        if(rowIdx > -1) shS.deleteRow(rowIdx);
+      }
+      return jsonOut_({ok:true});
+    }
+    if(!session) return jsonOut_({ok:false, error:'Not authenticated — please log in.', authRequired:true});
+
     if(action === 'uploadAttachment'){
       const folder = getOrCreateAttachmentsFolder_();
       const bytes = Utilities.base64Decode(body.data.base64);
@@ -164,6 +281,9 @@ function doPost(e){
     }
 
     const sheetName = body.sheet;
+    if(sheetName === 'Users' && session.role !== 'admin'){
+      return jsonOut_({ok:false, error:'Admin access required.'});
+    }
     const sh = ss.getSheetByName(sheetName);
     if(!sh) return jsonOut_({ok:false, error:'Unknown sheet: ' + sheetName});
     const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
@@ -171,12 +291,23 @@ function doPost(e){
     if(action === 'create'){
       const id = body.id || Utilities.getUuid();
       const data = Object.assign({}, body.data, {id});
+      if(sheetName === 'Users'){
+        if(!data.email || !data.password) return jsonOut_({ok:false, error:'Email and password are required.'});
+        const dupe = getSheetData_('Users').find(u => String(u.email).toLowerCase() === String(data.email).toLowerCase());
+        if(dupe) return jsonOut_({ok:false, error:'A user with that email already exists.'});
+        data.passwordHash = hashPassword_(data.password);
+        delete data.password;
+        data.role = data.role === 'admin' ? 'admin' : 'user';
+      }
+      if(sheetName === 'JobTickets' && !data.ticketNo){
+        data.ticketNo = nextTicketNo_();
+      }
       if(headers.indexOf('createdAt') > -1 && !data.createdAt) data.createdAt = new Date().toISOString();
       if(headers.indexOf('savedAt') > -1 && !data.savedAt) data.savedAt = new Date().toISOString();
       if(headers.indexOf('addedAt') > -1 && !data.addedAt) data.addedAt = new Date().toISOString();
       const row = headers.map(h => data[h] !== undefined ? data[h] : '');
       sh.appendRow(row);
-      return jsonOut_({ok:true, id});
+      return jsonOut_({ok:true, id, ticketNo: data.ticketNo});
     }
     if(action === 'update'){
       const rowIdx = findRowIndexById_(sh, body.id);
@@ -184,12 +315,24 @@ function doPost(e){
       const current = {};
       const values = sh.getRange(rowIdx,1,1,headers.length).getValues()[0];
       headers.forEach((h,i) => current[h] = values[i]);
-      const merged = Object.assign(current, body.data, {id: body.id});
+      const incoming = Object.assign({}, body.data);
+      if(sheetName === 'Users'){
+        if(incoming.password){ incoming.passwordHash = hashPassword_(incoming.password); }
+        delete incoming.password;
+        if(incoming.role) incoming.role = incoming.role === 'admin' ? 'admin' : 'user';
+      }
+      const merged = Object.assign(current, incoming, {id: body.id});
       const row = headers.map(h => merged[h] !== undefined ? merged[h] : '');
       sh.getRange(rowIdx,1,1,headers.length).setValues([row]);
       return jsonOut_({ok:true});
     }
     if(action === 'delete'){
+      if(sheetName === 'Users'){
+        const target = getSheetData_('Users').find(u => String(u.id) === String(body.id));
+        if(target && String(target.email).toLowerCase() === MASTER_EMAIL.toLowerCase()){
+          return jsonOut_({ok:false, error:'The master admin account cannot be deleted.'});
+        }
+      }
       const rowIdx = findRowIndexById_(sh, body.id);
       if(rowIdx === -1) return jsonOut_({ok:false, error:'Row not found'});
       sh.deleteRow(rowIdx);
