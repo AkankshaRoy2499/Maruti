@@ -19,9 +19,12 @@ the first time the backend runs:
 - Password: `Admin@123`
 
 The master admin can create additional users (admin or regular) from the
-**Admin** button in the top bar. Passwords are hashed (SHA-256 + a fixed
-pepper) before they're written to the Sheet — change `PASSWORD_PEPPER` in
-`Code.gs` if every existing password needs to be invalidated at once.
+**Admin** button in the top bar, which also lists every existing user's
+password. Passwords are currently stored in **plain text** in the Users
+sheet (by request, so an admin can read/manage them directly in the Sheet
+or the Admin panel) — anyone with edit access to the Sheet, or an admin
+login to the app, can see every password. Tighten this later (hash them)
+if that stops being an acceptable tradeoff.
 
 ## Project structure
 

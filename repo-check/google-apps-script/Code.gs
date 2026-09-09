@@ -28,8 +28,12 @@
  * is exactly what was requested when this was set up; edit the constant here and
  * redeploy a "New version" if it was meant to be something else, then re-run once so
  * the Users sheet re-seeds — it only seeds when the Users sheet is empty). The master
- * admin can create additional users from the app's Admin panel; passwords are hashed
- * (SHA-256 + a fixed pepper) before they're ever written to the sheet.
+ * admin can create additional users from the app's Admin panel.
+ *
+ * NOTE: passwords are currently stored in PLAIN TEXT in the Users sheet (by request,
+ * so an admin can open the sheet and read/manage them directly) — anyone with edit
+ * access to the Sheet, or an admin login to the app, can see every password. Tighten
+ * this later by hashing (see git history for a SHA-256 version) if that stops being OK.
  */
 
 const SCHEMAS = {
@@ -40,14 +44,13 @@ const SCHEMAS = {
   JobTickets:       ['id','ticketNo','serviceId','jobDate','jobType','status','assignedTo','description','createdAt'],
   ReportTypes:      ['id','name','slug','schemaJson','createdAt'],
   Reports:          ['id','serviceId','jobTicketId','reportType','buildingName','inspType','inspDate','savedAt','dataJson'],
-  Users:            ['id','email','passwordHash','role','createdAt'],
+  Users:            ['id','email','password','role','createdAt'],
   Sessions:         ['id','userId','email','role','createdAt','expiresAt']
 };
 
 // Master admin — seeded once into the Users sheet the first time it's empty.
 const MASTER_EMAIL = 'support@maruti@zentrades.pro';
 const MASTER_PASSWORD = 'Admin@123';
-const PASSWORD_PEPPER = 'maruti-frb-2026'; // change this to force every existing password to stop working
 const SESSION_HOURS = 12;
 
 function ensureSheets(){
@@ -92,7 +95,7 @@ function seedMasterAdminIfNeeded_(){
   const rows = getSheetData_('Users');
   if(rows.length) return;
   const sh = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('Users');
-  sh.appendRow([Utilities.getUuid(), MASTER_EMAIL, hashPassword_(MASTER_PASSWORD), 'admin', new Date().toISOString()]);
+  sh.appendRow([Utilities.getUuid(), MASTER_EMAIL, MASTER_PASSWORD, 'admin', new Date().toISOString()]);
 }
 
 function getSheetData_(sheetName){
@@ -133,18 +136,6 @@ function jsonOut_(obj){
 }
 
 /* ============================= AUTH ============================= */
-
-function hashPassword_(password){
-  const digest = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(password) + PASSWORD_PEPPER);
-  return digest.map(b => (b < 0 ? b + 256 : b).toString(16).padStart(2,'0')).join('');
-}
-
-function stripPasswordHash_(row){
-  if(!row) return row;
-  const copy = {};
-  Object.keys(row).forEach(k=>{ if(k !== 'passwordHash') copy[k] = row[k]; });
-  return copy;
-}
 
 function makeSession_(user){
   const token = Utilities.getUuid();
@@ -208,13 +199,11 @@ function doGet(e){
       if(e.parameter.billingId) rows = rows.filter(r => String(r.billingId) === String(e.parameter.billingId));
       if(e.parameter.serviceId) rows = rows.filter(r => String(r.serviceId) === String(e.parameter.serviceId));
       if(e.parameter.jobTicketId) rows = rows.filter(r => String(r.jobTicketId) === String(e.parameter.jobTicketId));
-      if(sheetName === 'Users') rows = rows.map(stripPasswordHash_);
       return jsonOut_({ok:true, rows});
     }
     if(action === 'get'){
       const rows = getSheetData_(sheetName);
-      let row = rows.find(r => String(r.id) === String(e.parameter.id));
-      if(sheetName === 'Users') row = stripPasswordHash_(row);
+      const row = rows.find(r => String(r.id) === String(e.parameter.id));
       return jsonOut_({ok:true, row: row || null});
     }
     if(action === 'search'){
@@ -242,7 +231,7 @@ function doPost(e){
       const email = String(body.email || '').trim();
       const password = String(body.password || '');
       const user = getSheetData_('Users').find(u => String(u.email).toLowerCase() === email.toLowerCase());
-      if(!user || user.passwordHash !== hashPassword_(password)){
+      if(!user || String(user.password) !== password){
         return jsonOut_({ok:false, error:'Incorrect email or password.'});
       }
       cleanupExpiredSessions_();
@@ -295,8 +284,6 @@ function doPost(e){
         if(!data.email || !data.password) return jsonOut_({ok:false, error:'Email and password are required.'});
         const dupe = getSheetData_('Users').find(u => String(u.email).toLowerCase() === String(data.email).toLowerCase());
         if(dupe) return jsonOut_({ok:false, error:'A user with that email already exists.'});
-        data.passwordHash = hashPassword_(data.password);
-        delete data.password;
         data.role = data.role === 'admin' ? 'admin' : 'user';
       }
       if(sheetName === 'JobTickets' && !data.ticketNo){
@@ -317,8 +304,7 @@ function doPost(e){
       headers.forEach((h,i) => current[h] = values[i]);
       const incoming = Object.assign({}, body.data);
       if(sheetName === 'Users'){
-        if(incoming.password){ incoming.passwordHash = hashPassword_(incoming.password); }
-        delete incoming.password;
+        if(!incoming.password) delete incoming.password; // don't blank out an existing password by accident
         if(incoming.role) incoming.role = incoming.role === 'admin' ? 'admin' : 'user';
       }
       const merged = Object.assign(current, incoming, {id: body.id});

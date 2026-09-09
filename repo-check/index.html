@@ -2977,7 +2977,7 @@ async function renderAdminUsersBody(){
     <div id="adminUsersList">
       ${users.length ? users.map(u=>`
         <div class="report-row">
-          <div><strong>${u.email}</strong><div class="meta">${u.role||'user'} · added ${u.createdAt?fmtDate(String(u.createdAt).slice(0,10)):''}</div></div>
+          <div><strong>${u.email}</strong><div class="meta">${u.role||'user'} · added ${u.createdAt?fmtDate(String(u.createdAt).slice(0,10)):''} · password: <code>${u.password||''}</code></div></div>
         </div>`).join('') : '<div class="crm-empty">No users yet.</div>'}
     </div>
     <h4 style="margin-top:18px;">Add a user</h4>
